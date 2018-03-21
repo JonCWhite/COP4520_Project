@@ -18,17 +18,30 @@
 #include <atomic>
 // required for use of uint64_t
 #include <cstdint>
+#include <exception>
 #include <functional>
+#include <iostream>
+#include <string>
 
 class NB_Hashtable
 {
 public:
 	NB_Hashtable();
 	void Init();
+	// "The key and state must be modified atomically; we use the <., .> operator
+	// to represent packing them into a single word. A key k is considered
+	// inserted if some bucket in the table contains <k, member>."
+	// So, although the prototype for Lookup uses Key K, we use WORD_SIZE_TYPE
+	// rather than some custom class key.
+	bool Lookup(WORD_SIZE_TYPE k);
+	bool Insert(WORD_SIZE_TYPE k);
 
 private:
 	void InitProbeBound(WORD_SIZE_TYPE h);
-	int GetProbeBound(WORD_SIZE_TYPE h);
+	// This returns an index of bounds. It is int in the psuedocode, but bounds
+	// contains WORD_SIZE_TYPE in our code. Thus this functions must instead
+	// return WORD_SIZE_TYPE.
+	WORD_SIZE_TYPE GetProbeBound(WORD_SIZE_TYPE h);
 	void ConditionallyRaiseBound(WORD_SIZE_TYPE h, WORD_SIZE_TYPE index);
 	void ConditionallyLowerBound(WORD_SIZE_TYPE h, WORD_SIZE_TYPE index);
 	std::atomic<WORD_SIZE_TYPE>* Bucket(WORD_SIZE_TYPE h, WORD_SIZE_TYPE index);
@@ -52,6 +65,7 @@ NB_Hashtable::NB_Hashtable()
 	buckets = new std::atomic<WORD_SIZE_TYPE>[size];
 }
 
+// Initializes buckets and bounds arrays.
 void NB_Hashtable::Init()
 {
 	for (int i = 0; i < size; i++)
@@ -59,6 +73,85 @@ void NB_Hashtable::Init()
 		InitProbeBound(i);
 		buckets[i] = 0;
 	}
+}
+
+// Determines whether k is a member of the set.
+bool NB_Hashtable::Lookup(WORD_SIZE_TYPE k)
+{
+	WORD_SIZE_TYPE h = std::hash<WORD_SIZE_TYPE>{}(k);
+	WORD_SIZE_TYPE max = GetProbeBound(h);
+
+	// i is WORD_SIZE_TYPE so it can be passed to Bucket().
+	for (WORD_SIZE_TYPE i = 0; i < max; i++)
+	{
+		if (*Bucket(h, i) == k)
+		{
+			return true;
+		}
+	}
+
+	return false;
+}
+
+// Insert k into the set if it is not a member
+bool NB_Hashtable::Insert(WORD_SIZE_TYPE k)
+{
+	WORD_SIZE_TYPE h = std::hash<WORD_SIZE_TYPE>{}(k);
+	WORD_SIZE_TYPE i = 0, temp;
+
+	// Attempt to change bucket entry from state empty (00) to busy (01).
+	while (!std::atomic_compare_exchange_weak(Bucket(h, i), 0, 1))
+	{
+		i++;
+		if (i >= size)
+		{
+			try
+			{
+				throw "Table full";
+			}
+			catch (std::string s)
+			{
+				std::cout << s << std::endl;
+			}
+		}
+	}
+	// attempt to insert a unique copy of k
+	do
+	{
+		// set state bit of <key, state> to inserting (10)
+		temp = (k | (WORD_SIZE_TYPE)2);
+		*Bucket(h, i) = temp;
+		ConditionallyRaiseBound(h, i);
+		
+		// Scan through probe sequence
+		WORD_SIZE_TYPE max = GetProbeBound(h);
+		for (WORD_SIZE_TYPE j = 0; j < max; j++)
+		{
+			if (j != i)
+			{
+				// Stall concurrent inserts
+				if (*Bucket(h, j) = temp)
+				{
+					std::atomic_compare_exchange_strong(Bucket(h, j),
+						&temp,
+						1);
+				}
+				// Abort if k is already a member
+				if (*Bucket(h, j) == (k | (WORD_SIZE_TYPE)3))
+				{
+					*Bucket(h, i) = 1;
+					ConditionallyLowerBound(h, i);
+					*Bucket(h, i) = 0;
+					return false;
+				}
+			}
+		}
+	// attempt to set bit of <key, state> to member (11)
+	} while (!std::atomic_compare_exchange_weak(Bucket(h,i),
+		&temp, 
+		(k | (WORD_SIZE_TYPE) 3)));
+
+	return true;
 }
 
 
@@ -74,7 +167,7 @@ void NB_Hashtable::InitProbeBound(WORD_SIZE_TYPE h)
 
 // Returns the maximum offset of any collision in a probe sequence as well as
 // that bound's scanning bit <bound, scanning>
-int NB_Hashtable::GetProbeBound(WORD_SIZE_TYPE h)
+WORD_SIZE_TYPE NB_Hashtable::GetProbeBound(WORD_SIZE_TYPE h)
 {
 	return bounds[h];
 }
@@ -119,6 +212,7 @@ void NB_Hashtable::ConditionallyLowerBound(WORD_SIZE_TYPE h, WORD_SIZE_TYPE inde
 	}
 }
 
+// Return bucket entry at hash value plus offset (using quadratic probing)
 std::atomic<WORD_SIZE_TYPE>* NB_Hashtable::Bucket(WORD_SIZE_TYPE h, WORD_SIZE_TYPE index)
 {
 	return &buckets[(h + index * (index + 1) / 2) % size];
