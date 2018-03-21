@@ -35,6 +35,7 @@ public:
 	// rather than some custom class key.
 	bool Lookup(WORD_SIZE_TYPE k);
 	bool Insert(WORD_SIZE_TYPE k);
+	bool Erase(WORD_SIZE_TYPE k);
 
 private:
 	void InitProbeBound(WORD_SIZE_TYPE h);
@@ -152,6 +153,34 @@ bool NB_Hashtable::Insert(WORD_SIZE_TYPE k)
 		(k | (WORD_SIZE_TYPE) 3)));
 
 	return true;
+}
+
+// Remove k from the set if it is a member
+bool NB_Hashtable::Erase(WORD_SIZE_TYPE k)
+{
+	WORD_SIZE_TYPE h = std::hash<WORD_SIZE_TYPE>{}(k);
+	// scan probe sequence
+	WORD_SIZE_TYPE max = GetProbeBound(h);
+	WORD_SIZE_TYPE temp = (k | (WORD_SIZE_TYPE)3);
+
+	for (WORD_SIZE_TYPE i = 0; i < max; i++)
+	{
+		// remove a copy of <k, member>
+		// May have to modify this to specify that k's status must be member 
+		// if that is not a pre-condition for Erase().
+		if (*Bucket(h, i) == /*k*/ temp)
+		{
+			// Set status bit to busy (01)
+			if (std::atomic_compare_exchange_strong(Bucket(h, i), &temp, 1))
+			{
+				ConditionallyLowerBound(h, i);
+				*Bucket(h, i) = 0;
+				return true;
+			}
+		}
+	}
+
+	return false;
 }
 
 
