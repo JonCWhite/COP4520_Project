@@ -81,11 +81,12 @@ bool NB_Hashtable::Lookup(WORD_SIZE_TYPE k)
 {
 	WORD_SIZE_TYPE h = std::hash<WORD_SIZE_TYPE>{}(k);
 	WORD_SIZE_TYPE max = GetProbeBound(h);
+	WORD_SIZE_TYPE temp = (k | (WORD_SIZE_TYPE)3);
 
 	// i is WORD_SIZE_TYPE so it can be passed to Bucket().
 	for (WORD_SIZE_TYPE i = 0; i < max; i++)
 	{
-		if (*Bucket(h, i) == k)
+		if (*Bucket(h, i) == temp)
 		{
 			return true;
 		}
