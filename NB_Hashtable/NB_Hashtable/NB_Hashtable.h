@@ -38,6 +38,11 @@
 #include <iostream>
 #include <string>
 
+struct BucketT {
+	WORD_SIZE_TYPE vs; // <version, state>
+	WORD_SIZE_TYPE key;
+};
+
 class NB_Hashtable
 {
 public:
@@ -63,14 +68,14 @@ private:
 	WORD_SIZE_TYPE GetProbeBound(WORD_SIZE_TYPE h);
 	void ConditionallyRaiseBound(WORD_SIZE_TYPE h, WORD_SIZE_TYPE index);
 	void ConditionallyLowerBound(WORD_SIZE_TYPE h, WORD_SIZE_TYPE index);
-	std::atomic<WORD_SIZE_TYPE>* Bucket(WORD_SIZE_TYPE h, WORD_SIZE_TYPE index);
+	std::atomic<BucketT>* Bucket(WORD_SIZE_TYPE h, WORD_SIZE_TYPE index);
 	bool DoesBucketContainCollisions(WORD_SIZE_TYPE h, WORD_SIZE_TYPE index);
 
 	int size;
 	// bounds must contain values that are thesize of a machine word because it 
 	// stores data that will be used to atomically alter addresses
 	std::atomic<WORD_SIZE_TYPE>* bounds;
-	std::atomic<WORD_SIZE_TYPE>* buckets;
+	std::atomic<BucketT>* buckets;
 };
 
 // Public member functions
@@ -81,7 +86,7 @@ NB_Hashtable::NB_Hashtable()
 {
 	size = 1024;
 	bounds = new std::atomic<WORD_SIZE_TYPE>[size];
-	buckets = new std::atomic<WORD_SIZE_TYPE>[size];
+	buckets = new std::atomic<BucketT>[size];
 }
 
 // Initializes buckets and bounds arrays.
@@ -90,7 +95,10 @@ void NB_Hashtable::Init()
 	for (int i = 0; i < size; i++)
 	{
 		InitProbeBound(i);
-		buckets[i] = EMPTY;
+		BucketT expected = buckets[i].load();
+		BucketT desired = expected;
+		desired.vs = EMPTY;
+		buckets[i].compare_exchange_strong(expected, desired);
 	}
 }
 
@@ -266,7 +274,7 @@ void NB_Hashtable::ConditionallyLowerBound(WORD_SIZE_TYPE h, WORD_SIZE_TYPE inde
 }
 
 // Return bucket entry at hash value plus offset (using quadratic probing)
-std::atomic<WORD_SIZE_TYPE>* NB_Hashtable::Bucket(WORD_SIZE_TYPE h, WORD_SIZE_TYPE index)
+std::atomic<BucketT>* NB_Hashtable::Bucket(WORD_SIZE_TYPE h, WORD_SIZE_TYPE index)
 {
 	return &buckets[(h + index * (index + 1) / 2) % size];
 }
@@ -276,15 +284,22 @@ std::atomic<WORD_SIZE_TYPE>* NB_Hashtable::Bucket(WORD_SIZE_TYPE h, WORD_SIZE_TY
 // and more than on a 32-bit system. This means that there are 2 unused bits
 // at the end of every address---just enough to identify these 4 states. 
 // Tentatively, here the codes I am using for my state codes:
-// empty = 00
-// busy = 01
-// inserting = 10
-// member = 11
+// empty = 000 => EMPTY = 0x0000000000000000
+// busy = 001 => BUSY = 0x2000000000000000
+// collided = 010 => COLLIDED = 0x4000000000000000
+// visible = 011 => VISIBLE = 0x6000000000000000
+// inserting = 100 => INSERTING = 0x8000000000000000
+// member = 101 => MEMBER = 0xA000000000000000
 bool NB_Hashtable::DoesBucketContainCollisions(WORD_SIZE_TYPE h, WORD_SIZE_TYPE index)
 {
-	// <state, key>
-	WORD_SIZE_TYPE k = *Bucket(h, index);
-	// Recover key from <state, key>
+	// <state, version> bit structure:
+	// First two bits are state, rest are for version. So, in:
+	// 1110 0000 0000 0000 0000 0000 0000 0000 0000 0000 0000 0000 0000 0000 0000 0000
+	// the 1s are the state portion and the 0s are for the version.
+	BucketT temp = *Bucket(h, index);
+	// <state1, version1>
+	WORD_SIZE_TYPE vs1 = temp.vs;
+	/* // Recover key from <state, key>
 	WORD_SIZE_TYPE key = k & ~MEMBER;
-	return ((k != EMPTY) && (std::hash<WORD_SIZE_TYPE>{}(key) == h));
+	return ((k != EMPTY) && (std::hash<WORD_SIZE_TYPE>{}(key) == h)); */
 }
