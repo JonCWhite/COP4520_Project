@@ -14,6 +14,21 @@
 // addressed type.
 #define WORD_SIZE_TYPE uint64_t
 
+// Constants for <state, key>
+// The order of the key and state was swapped so it would be easier to recover
+// the key. A key is always assumed to have its upper two bits unset.
+#define EMPTY 0x0000000000000000
+#define BUSY 0x4000000000000000
+#define INSERTING 0x8000000000000000
+#define MEMBER 0xC000000000000000
+
+// Constants for <scanning bit, bound>
+#define SCAN_TRUE 0x8000000000000000
+#define SCAN_FALSE 0x0000000000000000
+
+// Libraries used for testing
+#include <bitset>
+
 #include <algorithm>
 #include <atomic>
 // required for use of uint64_t
@@ -36,6 +51,9 @@ public:
 	bool Lookup(WORD_SIZE_TYPE k);
 	bool Insert(WORD_SIZE_TYPE k);
 	bool Erase(WORD_SIZE_TYPE k);
+
+	// TODO: Test functions?
+	//void printbuckets();
 
 private:
 	void InitProbeBound(WORD_SIZE_TYPE h);
@@ -72,7 +90,7 @@ void NB_Hashtable::Init()
 	for (int i = 0; i < size; i++)
 	{
 		InitProbeBound(i);
-		buckets[i] = 0;
+		buckets[i] = EMPTY;
 	}
 }
 
@@ -81,11 +99,12 @@ bool NB_Hashtable::Lookup(WORD_SIZE_TYPE k)
 {
 	WORD_SIZE_TYPE h = std::hash<WORD_SIZE_TYPE>{}(k);
 	WORD_SIZE_TYPE max = GetProbeBound(h);
-	WORD_SIZE_TYPE temp = (k | (WORD_SIZE_TYPE)3);
+	WORD_SIZE_TYPE temp = (k | MEMBER);
 
 	// i is WORD_SIZE_TYPE so it can be passed to Bucket().
-	for (WORD_SIZE_TYPE i = 0; i < max; i++)
+	for (WORD_SIZE_TYPE i = 0; i <= max; i++)
 	{
+		// std::cout << (*Bucket(h, i) & ~MEMBER) << std::endl;
 		if (*Bucket(h, i) == temp)
 		{
 			return true;
@@ -102,7 +121,8 @@ bool NB_Hashtable::Insert(WORD_SIZE_TYPE k)
 	WORD_SIZE_TYPE i = 0, temp;
 
 	// Attempt to change bucket entry from state empty (00) to busy (01).
-	while (!std::atomic_compare_exchange_weak(Bucket(h, i), 0, 1))
+	temp = EMPTY;
+	while (!std::atomic_compare_exchange_weak(Bucket(h, i), &temp, BUSY))
 	{
 		i++;
 		if (i >= size)
@@ -121,7 +141,7 @@ bool NB_Hashtable::Insert(WORD_SIZE_TYPE k)
 	do
 	{
 		// set state bit of <key, state> to inserting (10)
-		temp = (k | (WORD_SIZE_TYPE)2);
+		temp = (k | INSERTING);
 		*Bucket(h, i) = temp;
 		ConditionallyRaiseBound(h, i);
 		
@@ -132,18 +152,18 @@ bool NB_Hashtable::Insert(WORD_SIZE_TYPE k)
 			if (j != i)
 			{
 				// Stall concurrent inserts
-				if (*Bucket(h, j) = temp)
+				if (*Bucket(h, j) == temp)
 				{
 					std::atomic_compare_exchange_strong(Bucket(h, j),
 						&temp,
-						1);
+						BUSY);
 				}
 				// Abort if k is already a member
-				if (*Bucket(h, j) == (k | (WORD_SIZE_TYPE)3))
+				if (*Bucket(h, j) == (k | MEMBER))
 				{
-					*Bucket(h, i) = 1;
+					*Bucket(h, i) = BUSY;
 					ConditionallyLowerBound(h, i);
-					*Bucket(h, i) = 0;
+					*Bucket(h, i) = EMPTY;
 					return false;
 				}
 			}
@@ -151,7 +171,10 @@ bool NB_Hashtable::Insert(WORD_SIZE_TYPE k)
 	// attempt to set bit of <key, state> to member (11)
 	} while (!std::atomic_compare_exchange_weak(Bucket(h,i),
 		&temp, 
-		(k | (WORD_SIZE_TYPE) 3)));
+		(k | MEMBER)));
+
+	// std::bitset<64> tempBits((k | MEMBER));
+	// std::cout << tempBits.to_string() << std::endl;
 
 	return true;
 }
@@ -162,9 +185,9 @@ bool NB_Hashtable::Erase(WORD_SIZE_TYPE k)
 	WORD_SIZE_TYPE h = std::hash<WORD_SIZE_TYPE>{}(k);
 	// scan probe sequence
 	WORD_SIZE_TYPE max = GetProbeBound(h);
-	WORD_SIZE_TYPE temp = (k | (WORD_SIZE_TYPE)3);
+	WORD_SIZE_TYPE temp = (k | MEMBER);
 
-	for (WORD_SIZE_TYPE i = 0; i < max; i++)
+	for (WORD_SIZE_TYPE i = 0; i <= max; i++)
 	{
 		// remove a copy of <k, member>
 		// May have to modify this to specify that k's status must be member 
@@ -172,10 +195,10 @@ bool NB_Hashtable::Erase(WORD_SIZE_TYPE k)
 		if (*Bucket(h, i) == /*k*/ temp)
 		{
 			// Set status bit to busy (01)
-			if (std::atomic_compare_exchange_strong(Bucket(h, i), &temp, 1))
+			if (std::atomic_compare_exchange_strong(Bucket(h, i), &temp, BUSY))
 			{
 				ConditionallyLowerBound(h, i);
-				*Bucket(h, i) = 0;
+				*Bucket(h, i) = EMPTY;
 				return true;
 			}
 		}
@@ -189,17 +212,17 @@ bool NB_Hashtable::Erase(WORD_SIZE_TYPE k)
 
 // Private member functions
 
-// Sets the bound entry bound and scanning bit to <0, false>
+// Sets the bound entry bound and scanning bit to <false, 0>
 void NB_Hashtable::InitProbeBound(WORD_SIZE_TYPE h)
 {
-	bounds[h] = (WORD_SIZE_TYPE) 0;
+	bounds[h % size] = SCAN_FALSE;
 }
 
 // Returns the maximum offset of any collision in a probe sequence as well as
 // that bound's scanning bit <bound, scanning>
 WORD_SIZE_TYPE NB_Hashtable::GetProbeBound(WORD_SIZE_TYPE h)
 {
-	return bounds[h];
+	return bounds[h % size];
 }
 
 // NOTE FOR DEVELOPER (JON): Index has to be WORD_SIZE_TYPE (uint64_t) instead
@@ -210,34 +233,34 @@ void NB_Hashtable::ConditionallyRaiseBound(WORD_SIZE_TYPE h, WORD_SIZE_TYPE inde
 	WORD_SIZE_TYPE old_bound, new_bound;
 
 	do {
-		old_bound = bounds[h];
+		old_bound = bounds[h % size];
 		new_bound = std::max(old_bound, index);
-	} while (!std::atomic_compare_exchange_weak(&(bounds[h]), &old_bound, new_bound));
+	} while (!std::atomic_compare_exchange_weak(&(bounds[h % size]), &old_bound, new_bound));
 }
 
 // Allow maximum < index
 void NB_Hashtable::ConditionallyLowerBound(WORD_SIZE_TYPE h, WORD_SIZE_TYPE index)
 {
-	WORD_SIZE_TYPE bound = bounds[h]/*, expected*/;
+	WORD_SIZE_TYPE bound = bounds[h % size], expectedFalse, expectedTrue;
 
-	// If status bit is set, unset it
-	if ((bound & (WORD_SIZE_TYPE) 1) == ((WORD_SIZE_TYPE) 1))
+	// If scanning bit is set, unset it
+	if ((bound & SCAN_TRUE) == (SCAN_TRUE))
 	{
-		std::atomic_compare_exchange_weak(&bounds[h], &bound, (bound & ~((WORD_SIZE_TYPE) 1)));
+		std::atomic_compare_exchange_weak(&bounds[h % size], &bound, (bound & ~SCAN_TRUE));
 	}
 	
-	// 
+	expectedFalse = index & ~SCAN_TRUE;
 	if (index > 0)
 	{
-		//expected = index & ~((WORD_SIZE_TYPE)1);
-		while (std::atomic_compare_exchange_weak(&bounds[h], &index, (index | (WORD_SIZE_TYPE)1)))
+		while (std::atomic_compare_exchange_weak(&bounds[h % size], &expectedFalse, (index | SCAN_TRUE)))
 		{
 			WORD_SIZE_TYPE i = index - 1;
 			while ((i > 0) && (!DoesBucketContainCollisions(h, i)))
 			{
 				i--;
 			}
-			std::atomic_compare_exchange_weak(&bounds[h], &index, i);
+			expectedTrue = index | SCAN_TRUE;
+			std::atomic_compare_exchange_strong(&bounds[h % size], &expectedTrue, (i & ~SCAN_TRUE));
 		}
 	}
 }
@@ -259,6 +282,9 @@ std::atomic<WORD_SIZE_TYPE>* NB_Hashtable::Bucket(WORD_SIZE_TYPE h, WORD_SIZE_TY
 // member = 11
 bool NB_Hashtable::DoesBucketContainCollisions(WORD_SIZE_TYPE h, WORD_SIZE_TYPE index)
 {
-	WORD_SIZE_TYPE k= *Bucket(h, index);
-	return ((k != 0) && (std::hash<WORD_SIZE_TYPE>{}(k) == h));
+	// <state, key>
+	WORD_SIZE_TYPE k = *Bucket(h, index);
+	// Recover key from <state, key>
+	WORD_SIZE_TYPE key = k & ~MEMBER;
+	return ((k != EMPTY) && (std::hash<WORD_SIZE_TYPE>{}(key) == h));
 }
