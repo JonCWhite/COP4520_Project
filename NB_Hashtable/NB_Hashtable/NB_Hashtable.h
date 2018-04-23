@@ -14,13 +14,16 @@
 // addressed type.
 #define WORD_SIZE_TYPE uint64_t
 
-// Constants for <state, key>
+// Constants for <state, version>
 // The order of the key and state was swapped so it would be easier to recover
 // the key. A key is always assumed to have its upper two bits unset.
 #define EMPTY 0x0000000000000000
-#define BUSY 0x4000000000000000
+#define BUSY 0x2000000000000000
+#define COLLIDED 0x4000000000000000
+#define VISIBLE 0x6000000000000000
 #define INSERTING 0x8000000000000000
-#define MEMBER 0xC000000000000000
+#define MEMBER 0xA000000000000000
+#define GET_STATE 0xE000000000000000
 
 // Constants for <scanning bit, bound>
 #define SCAN_TRUE 0x8000000000000000
@@ -37,6 +40,11 @@
 #include <functional>
 #include <iostream>
 #include <string>
+
+struct BucketT {
+	WORD_SIZE_TYPE vs; // <version, state>
+	WORD_SIZE_TYPE key;
+};
 
 class NB_Hashtable
 {
@@ -63,14 +71,15 @@ private:
 	WORD_SIZE_TYPE GetProbeBound(WORD_SIZE_TYPE h);
 	void ConditionallyRaiseBound(WORD_SIZE_TYPE h, WORD_SIZE_TYPE index);
 	void ConditionallyLowerBound(WORD_SIZE_TYPE h, WORD_SIZE_TYPE index);
-	std::atomic<WORD_SIZE_TYPE>* Bucket(WORD_SIZE_TYPE h, WORD_SIZE_TYPE index);
+	std::atomic<BucketT>* Bucket(WORD_SIZE_TYPE h, WORD_SIZE_TYPE index);
 	bool DoesBucketContainCollisions(WORD_SIZE_TYPE h, WORD_SIZE_TYPE index);
+	bool Assist(WORD_SIZE_TYPE k, WORD_SIZE_TYPE h, WORD_SIZE_TYPE i, WORD_SIZE_TYPE ver_i);
 
 	int size;
 	// bounds must contain values that are thesize of a machine word because it 
 	// stores data that will be used to atomically alter addresses
 	std::atomic<WORD_SIZE_TYPE>* bounds;
-	std::atomic<WORD_SIZE_TYPE>* buckets;
+	std::atomic<BucketT>* buckets;
 };
 
 // Public member functions
@@ -81,7 +90,7 @@ NB_Hashtable::NB_Hashtable()
 {
 	size = 1024;
 	bounds = new std::atomic<WORD_SIZE_TYPE>[size];
-	buckets = new std::atomic<WORD_SIZE_TYPE>[size];
+	buckets = new std::atomic<BucketT>[size];
 }
 
 // Initializes buckets and bounds arrays.
@@ -90,7 +99,10 @@ void NB_Hashtable::Init()
 	for (int i = 0; i < size; i++)
 	{
 		InitProbeBound(i);
-		buckets[i] = EMPTY;
+		BucketT expected = buckets[i].load();
+		BucketT desired = expected;
+		desired.vs = EMPTY;
+		buckets[i].compare_exchange_strong(expected, desired);
 	}
 }
 
@@ -99,15 +111,23 @@ bool NB_Hashtable::Lookup(WORD_SIZE_TYPE k)
 {
 	WORD_SIZE_TYPE h = std::hash<WORD_SIZE_TYPE>{}(k);
 	WORD_SIZE_TYPE max = GetProbeBound(h);
-	WORD_SIZE_TYPE temp = (k | MEMBER);
+	//WORD_SIZE_TYPE temp = (k | MEMBER);
 
 	// i is WORD_SIZE_TYPE so it can be passed to Bucket().
 	for (WORD_SIZE_TYPE i = 0; i <= max; i++)
 	{
-		// std::cout << (*Bucket(h, i) & ~MEMBER) << std::endl;
-		if (*Bucket(h, i) == temp)
+		BucketT temp = *Bucket(h, i);
+		WORD_SIZE_TYPE vs = temp.vs;
+		if (((vs & GET_STATE) == MEMBER) && (temp.key == k))
 		{
-			return true;
+			// I think we should exclude this second load so that we can 
+			// establish the initial load into tempBucket as this function's 
+			// linearization point.
+			//BucketT tempBucket = *Bucket(h, i);
+			if (temp.vs == ((vs & ~GET_STATE) | MEMBER))
+			{
+				return true;
+			}
 		}
 	}
 
@@ -117,66 +137,53 @@ bool NB_Hashtable::Lookup(WORD_SIZE_TYPE k)
 // Insert k into the set if it is not a member
 bool NB_Hashtable::Insert(WORD_SIZE_TYPE k)
 {
+	BucketT expected, desired;
 	WORD_SIZE_TYPE h = std::hash<WORD_SIZE_TYPE>{}(k);
-	WORD_SIZE_TYPE i = 0, temp;
+	WORD_SIZE_TYPE i = -1, vs;
 
 	// Attempt to change bucket entry from state empty (00) to busy (01).
-	temp = EMPTY;
-	while (!std::atomic_compare_exchange_weak(Bucket(h, i), &temp, BUSY))
-	{
-		i++;
-		if (i >= size)
+	do {
+		if (++i >= size)
 		{
-			try
-			{
-				throw "Table full";
-			}
-			catch (std::string s)
-			{
-				std::cout << s << std::endl;
-			}
+			throw "Table full";
 		}
-	}
-	// attempt to insert a unique copy of k
-	do
-	{
-		// set state bit of <key, state> to inserting (10)
-		temp = (k | INSERTING);
-		*Bucket(h, i) = temp;
-		ConditionallyRaiseBound(h, i);
+		expected = Bucket(h, i)->load();
+		expected.vs = (expected.vs & ~GET_STATE) | EMPTY;
+		desired = expected;
+		desired.vs = (desired.vs & ~GET_STATE) | BUSY;
+		// <state, version>
+		vs = expected.vs;
+	} while (!Bucket(h, i)->compare_exchange_weak(expected, desired));
+	
+	BucketT temp = Bucket(h, i)->load();
+	temp.key = k;
+	Bucket(h, i)->store(temp);
 		
-		// Scan through probe sequence
-		WORD_SIZE_TYPE max = GetProbeBound(h);
-		for (WORD_SIZE_TYPE j = 0; j < max; j++)
+	while (true)
+	{
+		temp = Bucket(h, i)->load();
+		temp.vs = (vs & ~GET_STATE) | VISIBLE;
+		Bucket(h, i)->store(temp);
+		ConditionallyRaiseBound(h, i);
+		temp = Bucket(h, i)->load();
+		temp.vs = (vs & ~GET_STATE) | INSERTING;
+		Bucket(h, i)->store(temp);
+		bool assisted = Assist(k, h, i, (vs & ~GET_STATE));
+		temp = Bucket(h, i)->load();
+		if (temp.vs != ((vs & ~GET_STATE) | COLLIDED))
 		{
-			if (j != i)
-			{
-				// Stall concurrent inserts
-				if (*Bucket(h, j) == temp)
-				{
-					std::atomic_compare_exchange_strong(Bucket(h, j),
-						&temp,
-						BUSY);
-				}
-				// Abort if k is already a member
-				if (*Bucket(h, j) == (k | MEMBER))
-				{
-					*Bucket(h, i) = BUSY;
-					ConditionallyLowerBound(h, i);
-					*Bucket(h, i) = EMPTY;
-					return false;
-				}
-			}
+			return true;
 		}
-	// attempt to set bit of <key, state> to member (11)
-	} while (!std::atomic_compare_exchange_weak(Bucket(h,i),
-		&temp, 
-		(k | MEMBER)));
-
-	// std::bitset<64> tempBits((k | MEMBER));
-	// std::cout << tempBits.to_string() << std::endl;
-
-	return true;
+		if (!assisted)
+		{
+			ConditionallyLowerBound(h, i);
+			temp = Bucket(h, i)->load();
+			temp.vs = (vs & ~GET_STATE) | EMPTY;
+			temp.vs++;
+			return false;
+		}
+		vs++;
+	}
 }
 
 // Remove k from the set if it is a member
@@ -185,20 +192,32 @@ bool NB_Hashtable::Erase(WORD_SIZE_TYPE k)
 	WORD_SIZE_TYPE h = std::hash<WORD_SIZE_TYPE>{}(k);
 	// scan probe sequence
 	WORD_SIZE_TYPE max = GetProbeBound(h);
-	WORD_SIZE_TYPE temp = (k | MEMBER);
+	//WORD_SIZE_TYPE temp = (k | MEMBER);
 
 	for (WORD_SIZE_TYPE i = 0; i <= max; i++)
 	{
+		BucketT temp = Bucket(h, i)->load();
+		WORD_SIZE_TYPE vs = temp.vs;
 		// remove a copy of <k, member>
 		// May have to modify this to specify that k's status must be member 
 		// if that is not a pre-condition for Erase().
-		if (*Bucket(h, i) == /*k*/ temp)
+		if (((vs & GET_STATE) == MEMBER) && (temp.key == k))
 		{
 			// Set status bit to busy (01)
-			if (std::atomic_compare_exchange_strong(Bucket(h, i), &temp, BUSY))
+			BucketT expected = temp;
+			expected.vs = (expected.vs & ~GET_STATE) | MEMBER;
+			BucketT desired = expected;
+			desired.vs = (expected.vs & ~GET_STATE) | BUSY;
+			if (Bucket(h, i)->compare_exchange_strong(expected, desired))
 			{
 				ConditionallyLowerBound(h, i);
-				*Bucket(h, i) = EMPTY;
+				expected = Bucket(h, i)->load();
+				desired = expected;
+				// Since the version occupies the lower bits of our packed 
+				// variable, we can update that field with a simple increment.
+				desired.vs++;
+				desired.vs = (expected.vs & ~GET_STATE) | EMPTY;
+				Bucket(h, i)->compare_exchange_strong(expected, desired);
 				return true;
 			}
 		}
@@ -266,7 +285,7 @@ void NB_Hashtable::ConditionallyLowerBound(WORD_SIZE_TYPE h, WORD_SIZE_TYPE inde
 }
 
 // Return bucket entry at hash value plus offset (using quadratic probing)
-std::atomic<WORD_SIZE_TYPE>* NB_Hashtable::Bucket(WORD_SIZE_TYPE h, WORD_SIZE_TYPE index)
+std::atomic<BucketT>* NB_Hashtable::Bucket(WORD_SIZE_TYPE h, WORD_SIZE_TYPE index)
 {
 	return &buckets[(h + index * (index + 1) / 2) % size];
 }
@@ -276,15 +295,102 @@ std::atomic<WORD_SIZE_TYPE>* NB_Hashtable::Bucket(WORD_SIZE_TYPE h, WORD_SIZE_TY
 // and more than on a 32-bit system. This means that there are 2 unused bits
 // at the end of every address---just enough to identify these 4 states. 
 // Tentatively, here the codes I am using for my state codes:
-// empty = 00
-// busy = 01
-// inserting = 10
-// member = 11
+// empty = 000 => EMPTY = 0x0000000000000000
+// busy = 001 => BUSY = 0x2000000000000000
+// collided = 010 => COLLIDED = 0x4000000000000000
+// visible = 011 => VISIBLE = 0x6000000000000000
+// inserting = 100 => INSERTING = 0x8000000000000000
+// member = 101 => MEMBER = 0xA000000000000000
 bool NB_Hashtable::DoesBucketContainCollisions(WORD_SIZE_TYPE h, WORD_SIZE_TYPE index)
 {
-	// <state, key>
-	WORD_SIZE_TYPE k = *Bucket(h, index);
-	// Recover key from <state, key>
-	WORD_SIZE_TYPE key = k & ~MEMBER;
-	return ((k != EMPTY) && (std::hash<WORD_SIZE_TYPE>{}(key) == h));
+	// <state, version> bit structure:
+	// First two bits are state, rest are for version. So, in:
+	// 1110 0000 0000 0000 0000 0000 0000 0000 0000 0000 0000 0000 0000 0000 0000 0000
+	// the 1s are the state portion and the 0s are for the version.
+	BucketT temp = *Bucket(h, index);
+	// <state1, version1>
+	WORD_SIZE_TYPE vs1 = temp.vs;
+	if (((vs1 & GET_STATE) == VISIBLE) || ((vs1 & GET_STATE) == INSERTING) ||
+		((vs1 & GET_STATE) == MEMBER))
+	{
+		if (std::hash<WORD_SIZE_TYPE>{}(temp.key) == h)
+		{
+			// Quadratic probe to next position where there would be a collision
+			BucketT temp = *Bucket(h, index);
+			// <state2, verrsion2>
+			WORD_SIZE_TYPE vs2 = temp.vs;
+			if (((vs2 & GET_STATE) == VISIBLE) || ((vs2 & GET_STATE) == INSERTING) ||
+				((vs2 & GET_STATE) == MEMBER))
+			{
+				if (vs1 == vs2)
+				{
+					return true;
+				}
+			}
+		}
+	}
+	return false;
+}
+
+// Returns true if no other cell is seen in member state
+bool NB_Hashtable::Assist(WORD_SIZE_TYPE k, WORD_SIZE_TYPE h, WORD_SIZE_TYPE i, WORD_SIZE_TYPE ver_i)
+{
+	WORD_SIZE_TYPE max = GetProbeBound(h);
+	for (WORD_SIZE_TYPE j = 0; j <= max; j++)
+	{
+		if (j != i)
+		{
+			BucketT temp = Bucket(h, j)->load();
+			if (((temp.vs & GET_STATE) == INSERTING) && (temp.key == k))
+			{
+				if (j < i)
+				{
+					// Assist any insert found earlier in the probe sequence
+					if (temp.vs == ((temp.vs & ~GET_STATE) | INSERTING))
+					{
+						BucketT expected = Bucket(h, i)->load();
+						expected.vs = (expected.vs & ~GET_STATE) | INSERTING;
+						BucketT desired = expected;
+						desired.vs = (desired.vs & ~GET_STATE) | COLLIDED;
+						Bucket(h, i)->compare_exchange_strong(expected, desired);
+						return Assist(k, h, j, temp.vs);
+					}
+					// Fail any insert found later in the probe sequence
+					else
+					{
+						BucketT bucket_i = Bucket(h, i)->load();
+						if (bucket_i.vs == ((ver_i & ~GET_STATE) | INSERTING))
+						{
+							BucketT expected = temp;
+							expected.vs = (expected.vs & ~GET_STATE) | INSERTING;
+							BucketT desired = expected;
+							desired.vs = (desired.vs & ~GET_STATE) | COLLIDED;
+							Bucket(h, i)->compare_exchange_strong(expected, desired);
+						}
+					}
+				}
+			}
+			// Abort if k already a member
+			temp = Bucket(h, j)->load();
+			if (((temp.vs & GET_STATE) == MEMBER) && (temp.key == k))
+			{
+				if (temp.vs == ((temp.vs & ~GET_STATE) | MEMBER))
+				{
+					BucketT expected = Bucket(h, i)->load();
+					expected.vs = (expected.vs & ~GET_STATE) | INSERTING;
+					BucketT desired = expected;
+					desired.vs = (desired.vs & ~GET_STATE) | COLLIDED;
+					Bucket(h, i)->compare_exchange_strong(expected, desired);
+				}
+				return false;
+			}
+		}
+	}
+	BucketT expected = Bucket(h, i)->load();
+	expected.vs = (ver_i & ~GET_STATE) | INSERTING;
+	BucketT desired = expected;
+	desired.vs = (ver_i & ~GET_STATE) | MEMBER;
+	Bucket(h, i)->compare_exchange_strong(expected, desired);
+
+	return true;
 }
